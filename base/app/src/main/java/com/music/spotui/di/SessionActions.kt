@@ -38,8 +38,8 @@ object SessionActions {
         }
         com.music.spotui.data.local.ListenHistory.clear()
         com.music.spotui.data.preferences.clearSpotiflacSessions(app)
-        _signedOut.value = true
-        MyspotiRuntime.host.logout()
+        // Open the next login only after cookies and browser storage have been cleared.
+        MyspotiRuntime.host.logout { _signedOut.value = true }
     }
 
     /** The new account is signed in. */

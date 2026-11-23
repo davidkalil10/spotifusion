@@ -195,6 +195,7 @@ class WebPlayerHost(private val context: Context) : BridgeHost {
             setAcceptThirdPartyCookies(webView, true)
         }
         exposeToPlayer("MyspotiHost") { json -> _messages.tryEmit(json) }
+        LoginDiagnostics.install(this)
         webChromeClient = object : WebChromeClient() {
             override fun onConsoleMessage(message: android.webkit.ConsoleMessage): Boolean {
                 if (message.messageLevel() == android.webkit.ConsoleMessage.MessageLevel.ERROR ||
@@ -487,7 +488,7 @@ class WebPlayerHost(private val context: Context) : BridgeHost {
     fun openLogin() = main.post { view.alpha = 1f; view.loadUrl(LOGIN_URL) }
 
     /** Signs out of Spotify in this WebView, then shows the login page. */
-    fun logout() = main.post {
+    fun logout(onLoggedOut: () -> Unit = {}) = main.post {
         CookieManager.getInstance().removeAllCookies {
             main.post {
                 // Web storage too: localStorage/IndexedDB hold the player's session
@@ -495,6 +496,7 @@ class WebPlayerHost(private val context: Context) : BridgeHost {
                 android.webkit.WebStorage.getInstance().deleteAllData()
                 view.clearCache(true)
                 view.loadUrl(LOGIN_URL)
+                onLoggedOut()
             }
         }
     }

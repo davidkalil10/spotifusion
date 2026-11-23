@@ -415,8 +415,7 @@ private fun CheckUpdateRow() {
 
 /**
  * Hands the exported report to the share sheet. The file goes through the app's FileProvider;
- * if the provider refuses the path (external storage absent), the report's own path is shared
- * instead, so the tester still has something to send.
+ * if the provider refuses the path (external storage absent), share the report as text.
  */
 private fun shareDiagnosticReport(context: android.content.Context, file: java.io.File) {
     val send = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
@@ -431,7 +430,7 @@ private fun shareDiagnosticReport(context: android.content.Context, file: java.i
         send.putExtra(android.content.Intent.EXTRA_STREAM, uri)
         send.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
     } else {
-        send.putExtra(android.content.Intent.EXTRA_TEXT, "Myspoti diagnostic report: ${file.absolutePath}")
+        send.putExtra(android.content.Intent.EXTRA_TEXT, file.readText())
     }
     context.startActivity(android.content.Intent.createChooser(send, null).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
 }

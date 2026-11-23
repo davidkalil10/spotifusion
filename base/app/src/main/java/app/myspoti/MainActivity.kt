@@ -34,16 +34,17 @@ private const val LOG = "Myspoti"
 /**
  * How long the player page is given to prove the session (a non-anonymous token) once it comes back.
  * The sign-in page stays in front while this runs — the address alone is never taken for a session —
- * and only a real token hands the screen to the player (see [MainActivity.watchLoginReturn]).
+ * and only a real token hands the screen to the player (see [MainActivity.waitForLoginSession]).
  */
-private const val SESSION_WAIT_MS = 6_000L
+private const val SESSION_WAIT_MS = 25_000L
 
 /**
  * The app's only screen host: the Compose UI, with the Web Player page attached behind it.
- * The page comes to the front only to sign in, on Spotify's own login pages.
+ * A separate mobile WebView shows Spotify's own login pages.
  */
 class MainActivity : AppCompatActivity() {
     private lateinit var root: FrameLayout
+    private var mobileLogin: app.myspoti.host.android.MobileSpotifyLogin? = null
     private var signedIn by mutableStateOf(false)
     private var showingLogin by mutableStateOf(false)
     /** Back from Spotify's login, waiting for the session: a native loading screen, not the web page. */
@@ -75,33 +76,28 @@ class MainActivity : AppCompatActivity() {
                     androidx.compose.foundation.layout.Box(androidx.compose.ui.Modifier.fillMaxSize()) {
                         when {
                             showSpotiflac -> com.music.spotui.ui.screens.SpotiflacScreen(onClose = { showSpotiflac = false; com.music.spotui.data.offline.SpotiflacGate.resume() })
+                            connecting -> ConnectingScreen()
                             signedIn && setupNeeded -> com.music.spotui.ui.screens.SetupScreen(
                                 onDone = { setupNeeded = false },
                                 onSpotiflac = { showSpotiflac = true },
                             )
                             signedIn -> App()
-                            connecting -> ConnectingScreen()
                             else -> WelcomeScreen(onLogin = { showLogin() })
                         }
                         // "Ask each time": the download quality question, above every screen.
                         com.music.spotui.ui.components.DownloadAskHost()
-                        // Beta and dev builds only: hold the faint dot to copy the recent logs.
-                        if (com.music.spotui.data.api.UpdateChecker.isBeta || app.myspoti.engine.BuildConfig.DEBUG)
-                            com.music.spotui.ui.components.BetaLogButton(
-                                androidx.compose.ui.Modifier.align(androidx.compose.ui.Alignment.BottomEnd))
                     }
                 }
             }
         }
         root.addView(compose, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         setContentView(root)
-        // Haptics (buttons, likes, the debug icon) go through this window.
+        // Haptics (buttons and likes) go through this window.
         com.music.spotui.di.Haptics.attach(compose)
         // Debug builds: `am start ... --ez showPlayer true` shows the Web Player page full screen.
         val debuggable = applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
         MyspotiRuntime.host.attach(root, visible = debuggable && intent.getBooleanExtra("showPlayer", false))
         watchSession()
-        watchLoginReturn()
         watchLogout()
         // Only on a fresh start: on recreation (theme, locale, process restore)
         // the same intent would play its link again. New links arrive in onNewIntent.
@@ -129,6 +125,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        mobileLogin?.close()
         // The process-wide WebView lives in this activity's root while attached:
         // detach it, or view.parent -> root keeps the destroyed activity (and its
         // whole view tree) alive for the rest of the playback session.
@@ -138,13 +135,26 @@ class MainActivity : AppCompatActivity() {
 
     /** Spotify's login page, full screen, until the Web Player comes back signed in. */
     private fun showLogin() {
+        loginWait?.cancel()
         showingLogin = true
-        MyspotiRuntime.host.attach(root, visible = true)
-        MyspotiRuntime.host.openLogin()
+        connecting = false
+        mobileLogin?.close()
+        MyspotiRuntime.host.attach(root, visible = false)
+        mobileLogin = app.myspoti.host.android.MobileSpotifyLogin(this, onFailure = {
+            if (!isFinishing && !isDestroyed) showLogin()
+        }) {
+            connecting = true
+            // Discard the old page's ready state before checking the new cookie-backed session.
+            MyspotiRuntime.spotify.onPageStarting()
+            MyspotiRuntime.host.reload()
+            waitForLoginSession()
+        }.also { it.open(root) }
     }
 
     private fun hideLogin() {
+        mobileLogin?.close()
         showingLogin = false
+        connecting = false
         MyspotiRuntime.host.attach(root, visible = false)
     }
 
@@ -154,68 +164,30 @@ class MainActivity : AppCompatActivity() {
             com.music.spotui.di.SessionActions.signedOut.collect { out ->
                 if (out && signedIn) {
                     signedIn = false
-                    showingLogin = true
-                    MyspotiRuntime.host.attach(root, visible = true)
+                    showLogin()
                 }
             }
         }
     }
 
-    /**
-     * Spotify sent the user back to the player: the page is hidden now, the session follows.
-     *
-     * The address is not a session. The page comes back to open.spotify.com while its token is
-     * still anonymous when the login never finished (the e-mail step that hangs — the reported
-     * "stuck on the e-mail screen"), and hiding the page on that alone left a spinner that never
-     * stopped. The return is bounded: no token after [SESSION_WAIT_MS], the login page comes back.
-     */
-    private fun watchLoginReturn() {
-        lifecycleScope.launch {
-            MyspotiRuntime.host.url.collect { url ->
-                val backOnPlayer = url.startsWith("https://open.spotify.com") && !url.contains("/login")
-                if (!(showingLogin && backOnPlayer)) return@collect
-                // The address is not a session — and it comes back to open.spotify.com as soon as the
-                // user leaves the app to read the sign-in e-mail. Hiding the page here showed an
-                // anonymous player: an app that looked signed in with nothing playable (reported).
-                // The login page therefore stays in FRONT until a real token exists.
-                loginWait?.cancel()
-                loginWait = launch {
-                    var waited = 0L
-                    while (waited < SESSION_WAIT_MS) {
-                        if (runCatching { MyspotiRuntime.isSignedIn() }.getOrDefault(false)) {
-                            android.util.Log.d(LOG, "session established: player shown")
-                            hideLogin()
-                            return@launch
-                        }
-                        // The countdown only runs while the user is looking at the app: away to read
-                        // the e-mail, the sign-in page must not be reset under them.
-                        if (lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) waited += 500
-                        kotlinx.coroutines.delay(500)
-                    }
-                    android.util.Log.d(LOG, "no session ${SESSION_WAIT_MS / 1000}s after the player came back: sign-in page restored")
-                    // The page may now be the anonymous player: send it back to the e-mail step so the
-                    // user is not left where nothing plays.
-                    if (!showingLogin) showLogin() else MyspotiRuntime.host.openLogin()
+    /** Verify the player session only after the mobile sign-in redirects back. */
+    private fun waitForLoginSession() {
+        loginWait?.cancel()
+        loginWait = lifecycleScope.launch {
+            var waited = 0L
+            while (waited < SESSION_WAIT_MS) {
+                if (MyspotiRuntime.spotify.ready.value && !MyspotiRuntime.host.loginRequired.value &&
+                    runCatching { MyspotiRuntime.isSignedIn() }.getOrDefault(false)) {
+                    android.util.Log.d(LOG, "session established: player shown")
+                    hideLogin()
+                    return@launch
                 }
+                // Reading the email in another app must not expire the pending sign-in.
+                if (lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) waited += 500
+                kotlinx.coroutines.delay(500)
             }
-        }
-    }
-
-    /**
-     * Back from the e-mail app: the session may have been established while away, or the page may
-     * have reloaded into the anonymous player. Only the token decides — never the address.
-     */
-    override fun onResume() {
-        super.onResume()
-        if (!showingLogin) return
-        lifecycleScope.launch {
-            if (MyspotiRuntime.awaitSignedIn(1_500)) {
-                android.util.Log.d(LOG, "back with a session: player shown")
-                hideLogin()
-            } else if (MyspotiRuntime.host.url.value.let { it.startsWith("https://open.spotify.com") && !it.contains("/login") }) {
-                android.util.Log.d(LOG, "back without a session: sign-in page restored")
-                MyspotiRuntime.host.openLogin()
-            }
+            android.util.Log.d(LOG, "session not established: mobile sign-in restored")
+            showLogin()
         }
     }
 
@@ -227,6 +199,8 @@ class MainActivity : AppCompatActivity() {
         val api = MyspotiRuntime.spotify
         lifecycleScope.launch {
             combine(api.ready, MyspotiRuntime.loginRequired) { ready, login -> ready to login }.collect { (ready, login) ->
+                // Background player events must not interrupt typing or reading the email code.
+                if (mobileLogin?.isOpen == true) return@collect
                 when {
                     login && !showingLogin && signedIn -> showLogin()
                     ready && !login -> {

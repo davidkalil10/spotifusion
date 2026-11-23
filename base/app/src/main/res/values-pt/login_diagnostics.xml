@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="diagnostic_export_title">Exportar relatório de diagnóstico</string>
+    <string name="diagnostic_export_failed">Não foi possível exportar o relatório de diagnóstico</string>
+</resources>
